@@ -37,7 +37,7 @@ using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Z.EntityFramework.Plus
 {
-    /// <summary>Class to batch delete.</summary>
+    /// <summary>Class to batch update.</summary>
     public class BatchUpdate
     {
         public class NullValue
@@ -52,6 +52,11 @@ SET {SetValue}
 FROM {TableName} AS A
 INNER JOIN ( {Select}
            ) AS B ON {PrimaryKeys}
+";
+
+        internal const string CommandTextTemplateNoJoin = @"
+UPDATE {TableName} {Hint}
+SET {SetValue}
 ";
 
         internal const string CommandTextTemplateSqlCe = @"
@@ -522,6 +527,15 @@ SELECT  @totalRowAffected
                     string.Concat("A.", EscapeName(x.Item1, isMySql, isOracle, isPostgreSQL), " = @zzz_BatchUpdate_", i)));
             }
 
+            // OPTIMIZE query
+            if (QuerySelectExclusivelyRefersToUpdatingTable(querySelect, store.Table)) {
+                commandTextTemplate = CommandTextTemplateNoJoin + GetWhereClause(querySelect);
+                setValues = setValues.Replace("A.", string.Empty);
+                if (isSQLite || isMySql || isOracle || isPostgreSQL || isSqlCe) {
+                    commandTextTemplate = commandTextTemplate.Replace("{Hint}", string.Empty);
+                }
+            }
+
             // REPLACE template
             commandTextTemplate = commandTextTemplate.Replace("{TableName}", tableName)
                 .Replace("{Select}", querySelect)
@@ -686,13 +700,11 @@ SELECT  @totalRowAffected
 
             string tableName = "";
             string primaryKeys = "";
-
+            var entityType = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
             if (isSqlServer)
             {
-                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] {entity});
-
                 // GET mapping
-                tableName = string.IsNullOrEmpty(sqlServer.Schema) ? string.Concat("[", sqlServer.TableName, "]") : string.Concat("[", sqlServer.Schema, "].[", sqlServer.TableName, "]");
+                tableName = string.IsNullOrEmpty(entityType.Schema) ? string.Concat("[", entityType.TableName, "]") : string.Concat("[", entityType.Schema, "].[", entityType.TableName, "]");
 
                 // GET keys mappings
                 var columnKeys = new List<string>();
@@ -709,10 +721,8 @@ SELECT  @totalRowAffected
             }
             else if (isPostgreSQL)
             {
-                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] {entity});
-
                 // GET mapping
-                tableName = string.IsNullOrEmpty(sqlServer.Schema) ? string.Concat("\"", sqlServer.TableName, "\"") : string.Concat("\"", sqlServer.Schema, "\".\"", sqlServer.TableName, "\"");
+                tableName = string.IsNullOrEmpty(entityType.Schema) ? string.Concat("\"", entityType.TableName, "\"") : string.Concat("\"", entityType.Schema, "\".\"", entityType.TableName, "\"");
 
                 // GET keys mappings
                 var columnKeys = new List<string>();
@@ -729,10 +739,8 @@ SELECT  @totalRowAffected
             }
             else if (isMySqlPomelo)
             {
-                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
-
                 // GET mapping
-                tableName = string.Concat("`", sqlServer.TableName, "`");
+                tableName = string.Concat("`", entityType.TableName, "`");
 
                 // GET keys mappings
                 var columnKeys = new List<string>();
@@ -749,10 +757,8 @@ SELECT  @totalRowAffected
             }
             else if (isMySql)
             {
-                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
-
                 // GET mapping
-                tableName = string.Concat("`", sqlServer.TableName, "`");
+                tableName = string.Concat("`", entityType.TableName, "`");
 
                 // GET keys mappings
                 var columnKeys = new List<string>();
@@ -769,10 +775,8 @@ SELECT  @totalRowAffected
             }
             else if (isSQLite)
             {
-                var sqlServer = (IRelationalEntityTypeAnnotations)dynamicProviderEntityType.Invoke(null, new[] { entity });
-
                 // GET mapping
-                tableName = string.Concat("\"", sqlServer.TableName, "\"");
+                tableName = string.Concat("\"", entityType.TableName, "\"");
 
                 // GET keys mappings
                 var columnKeys = new List<string>();
@@ -832,6 +836,15 @@ SELECT  @totalRowAffected
             else if (isSQLite)
             {
                 setValues = string.Join("," + Environment.NewLine, values.Select((x, i) => x.Item2 is ConstantExpression ? string.Concat("\"", x.Item1, "\" = ", ((ConstantExpression)x.Item2).Value) : string.Concat("\"", x.Item1, "\" = @zzz_BatchUpdate_", i)));
+            }
+
+            // OPTIMIZE query
+            if (QuerySelectExclusivelyRefersToUpdatingTable(querySelect, entityType.TableName)) {
+                commandTextTemplate = CommandTextTemplateNoJoin + GetWhereClause(querySelect);
+                setValues = setValues.Replace("A.", string.Empty);
+                if (isSqlServer == false) {
+                    commandTextTemplate = commandTextTemplate.Replace("{Hint}", string.Empty);
+                }
             }
 
             // REPLACE template
@@ -1277,6 +1290,36 @@ SELECT  @totalRowAffected
             }
 
             return dictValues;
+        }
+
+        private static bool QuerySelectExclusivelyRefersToUpdatingTable(string querySelect, string updatingTable)
+        {
+            return Regex.IsMatch(querySelect, @"\sJOIN\s", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase) == false
+                   && Regex.Matches(querySelect, @"\sFROM\s", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase).Count == 1
+                   && Regex.IsMatch(querySelect, $@"\W{Regex.Escape(updatingTable)}\W");
+        }
+
+        private static string GetWhereClause(string querySelect)
+        {
+            var whereMatch = Regex.Match(querySelect, @"\sWHERE\s", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+            if (whereMatch.Success == false) {
+                return string.Empty;
+            }
+
+            var lastIndex = querySelect.Length;
+            var groupMatch = Regex.Match(querySelect, @"\sGROUP\s", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+            if (groupMatch.Success) {
+                lastIndex = groupMatch.Index;
+            } else {
+                var orderMatch = Regex.Match(querySelect, @"\sORDER\s", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+                if (orderMatch.Success) {
+                    lastIndex = orderMatch.Index;
+                }
+            }
+
+            var whereClause = querySelect.Substring(whereMatch.Index, lastIndex - whereMatch.Index);
+            whereClause = Regex.Replace(whereClause, @"[^\(\s\.]+\.", string.Empty);
+            return whereClause;
         }
     }
 }
